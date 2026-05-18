@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"
+            schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>gz_depth_republisher</name>
+  <version>0.2.0</version>
+  <description>
+    C++ ROS 2 Humble node that subscribes to a Gazebo gz.msgs.Image depth topic,
+    back-projects each pixel through camera intrinsics from gz.msgs.CameraInfo,
+    applies min/max range filtering, and publishes sensor_msgs/PointCloud2
+    for octomap_server. Ghost pixels (zero, NaN, Inf) are always discarded.
+  </description>
+
+  <maintainer email="maintainer@example.com">Maintainer</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <!-- Adjust version suffix to match your Gazebo release:
+       Gazebo Garden   (default on ROS 2 Humble) → gz-transport12 / gz-msgs9
+       Gazebo Harmonic                            → gz-transport13 / gz-msgs10
+       Gazebo Fortress                            → gz-transport11 / gz-msgs8  -->
+  <depend>gz-transport12</depend>
+  <depend>gz-msgs9</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

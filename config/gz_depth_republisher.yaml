@@ -1,0 +1,30 @@
+/**:
+  ros__parameters:
+
+    # ── gz-transport inputs ────────────────────────────────────────────────────
+    # Run `gz topic -l` while Gazebo is running to confirm topic names.
+    # A Gazebo depth camera named "depth_camera" typically publishes:
+    #   /depth_camera/depth_image    (gz.msgs.Image)
+    #   /depth_camera/camera_info    (gz.msgs.CameraInfo)
+    gz_image_topic: "/depth_camera/depth_image"
+    gz_info_topic:  "/depth_camera/camera_info"
+
+    # ── ROS 2 output ───────────────────────────────────────────────────────────
+    # Remap octomap_server's cloud_in → this topic.
+    ros_topic: "/depth_camera/points_filtered"
+
+    # ── ghost-pixel / range filter ─────────────────────────────────────────────
+    # Zero pixels (Gazebo no-return fill) and NaN/Inf are always dropped.
+    # Additionally drop anything outside [min_range, max_range].
+    #
+    # Tune min_range to your camera's minimum operating distance:
+    #   Intel RealSense D435  →  0.20 m
+    #   Azure Kinect          →  0.25 m
+    #   Orbbec Astra          →  0.40 m
+    #   Gazebo simulated      →  0.10–0.30 m
+    min_range: 0.3    # metres
+    max_range: 10.0   # metres
+
+    # ── TF frame for the published PointCloud2 header ──────────────────────────
+    # Must be the optical frame (Z forward, X right, Y down).
+    frame_id: "camera_depth_optical_frame"
