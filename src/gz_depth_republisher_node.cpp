@@ -24,7 +24,7 @@
 //   min_range         (double)  metres                 default: 0.3
 //   max_range         (double)  metres                 default: 10.0
 //   frame_id          (string)  header frame_id        default: camera_depth_optical_frame
-#include "gz_depth_republisher_node.hpp
+#include "gz_depth_republisher/gz_depth_republisher_node.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstring>
