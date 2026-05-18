@@ -24,7 +24,7 @@
 //   min_range         (double)  metres                 default: 0.3
 //   max_range         (double)  metres                 default: 10.0
 //   frame_id          (string)  header frame_id        default: camera_depth_optical_frame
-
+#include "gz_depth_republisher_node.hpp
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -165,34 +165,37 @@ private:
   // Store intrinsics. Called infrequently (only when camera params change).
   void info_callback(const gz::msgs::CameraInfo & info)
   {
-    // gz CameraInfo projection matrix P is row-major 3×4.
-    // For a simple pinhole camera:
+    // gz-msgs10 API:
+    //   info.projection()   → CameraInfo_Projection  with repeated double p()
+    //   info.intrinsics()   → CameraInfo_Intrinsics  with repeated double k()
+    //
+    // Projection matrix P is row-major 3×4:
     //   P = [ fx  0  cx  0 ]
     //       [  0  fy  cy  0 ]
     //       [  0   0   1  0 ]
-    if (info.projection_matrix().p_size() < 12) {
+    // K (intrinsic) is row-major 3×3:
+    //   K = [ fx  0  cx ]
+    //       [  0  fy  cy ]
+    //       [  0   0   1 ]
+    if (info.has_projection() && info.projection().p_size() >= 12) {
+      std::lock_guard<std::mutex> lk(intrinsics_mutex_);
+      fx_ = info.projection().p(0);
+      fy_ = info.projection().p(5);
+      cx_ = info.projection().p(2);
+      cy_ = info.projection().p(6);
+    } else if (info.has_intrinsics() && info.intrinsics().k_size() >= 9) {
       RCLCPP_WARN_ONCE(get_logger(),
-        "CameraInfo projection matrix has fewer than 12 elements — "
-        "falling back to intrinsic matrix K.");
-
-      if (info.intrinsics().k_size() < 9) {
-        RCLCPP_ERROR_ONCE(get_logger(),
-          "CameraInfo has no usable intrinsic matrix either. "
-          "Check your Gazebo sensor configuration.");
-        return;
-      }
-      // K is row-major 3×3: [fx 0 cx; 0 fy cy; 0 0 1]
+        "CameraInfo projection matrix unavailable — using intrinsic matrix K.");
       std::lock_guard<std::mutex> lk(intrinsics_mutex_);
       fx_ = info.intrinsics().k(0);
       fy_ = info.intrinsics().k(4);
       cx_ = info.intrinsics().k(2);
       cy_ = info.intrinsics().k(5);
     } else {
-      std::lock_guard<std::mutex> lk(intrinsics_mutex_);
-      fx_ = info.projection_matrix().p(0);
-      fy_ = info.projection_matrix().p(5);
-      cx_ = info.projection_matrix().p(2);
-      cy_ = info.projection_matrix().p(6);
+      RCLCPP_ERROR_ONCE(get_logger(),
+        "CameraInfo has no usable projection or intrinsic matrix. "
+        "Check your Gazebo sensor configuration.");
+      return;
     }
 
     intrinsics_ready_ = true;
@@ -286,9 +289,10 @@ private:
     auto out = std::make_unique<sensor_msgs::msg::PointCloud2>();
 
     out->header.frame_id = frame_id_;
-    if (img.has_header() && img.header().stamp_size() > 0) {
-      out->header.stamp.sec     = static_cast<int32_t>(img.header().stamp(0).sec());
-      out->header.stamp.nanosec = static_cast<uint32_t>(img.header().stamp(0).nsec());
+    // gz-msgs10: Header::stamp() returns a single gz::msgs::Time (not repeated)
+    if (img.has_header()) {
+      out->header.stamp.sec     = static_cast<int32_t>(img.header().stamp().sec());
+      out->header.stamp.nanosec = static_cast<uint32_t>(img.header().stamp().nsec());
     } else {
       out->header.stamp = now();
     }
