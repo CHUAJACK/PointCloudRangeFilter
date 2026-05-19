@@ -25,17 +25,22 @@ public:
       // ── Parameters ──────────────────────────────────────────────────────────
       this->declare_parameter<std::string>("gz_depth",       "/depth_camera");
       this->declare_parameter<std::string>("gz_camera_info", "/camera_info");
-      this->declare_parameter<double>     ("null_range",     0.0);
+      this->declare_parameter<double>     ("null_range_min",     0.0);
+      this->declare_parameter<double>     ("null_range_max",     1.0);
       this->declare_parameter<std::string>("output_topic",   "/depth_camera_bridged/points");
 
       gz_depth_topic_       = this->get_parameter("gz_depth").as_string();
       gz_camera_info_topic_ = this->get_parameter("gz_camera_info").as_string();
-      null_range_           = this->get_parameter("null_range").as_double();
+      null_range_min_           = this->get_parameter("null_range_min").as_double();
+      null_range_max_           = this->get_parameter("null_range_max").as_double();
       output_topic_         = this->get_parameter("output_topic").as_string();
+      min_z  = static_cast<float>(null_range_min_);
+      max_z  = static_cast<float>(null_range_max_);
 
       RCLCPP_INFO(get_logger(), "gz_depth       : %s", gz_depth_topic_.c_str());
       RCLCPP_INFO(get_logger(), "gz_camera_info : %s", gz_camera_info_topic_.c_str());
-      RCLCPP_INFO(get_logger(), "null_range     : %.4f", null_range_);
+      RCLCPP_INFO(get_logger(), "null_range_min     : %.4f", null_range_min_);
+      RCLCPP_INFO(get_logger(), "null_range_max     : %.4f", null_range_max_);
       RCLCPP_INFO(get_logger(), "output_topic   : %s", output_topic_.c_str());
 
       // ── Publisher ────────────────────────────────────────────────────────────
@@ -44,12 +49,7 @@ public:
         output_topic_, rclcpp::QoS(10).reliable());
       RCLCPP_INFO(get_logger(), "Publisher created.");
 
-      // ── Diagnostic timer ─────────────────────────────────────────────────────
-      RCLCPP_INFO(get_logger(), "Creating diagnostic timer...");
-      diag_timer_ = create_wall_timer(
-        std::chrono::seconds(3),
-        std::bind(&DepthToPointCloud::diagCallback, this));
-      RCLCPP_INFO(get_logger(), "Diagnostic timer created.");
+
 
       // ── gz-transport subscriptions ───────────────────────────────────────────
       RCLCPP_INFO(get_logger(), "Subscribing to gz topics...");
@@ -76,30 +76,7 @@ public:
   }
 
 private:
-  void diagCallback()
-  {
-    RCLCPP_INFO(get_logger(),
-      "Diag | camera_info: %s | depth: %s | clouds published: %lu | unknown_fmt: %lu",
-      gz_info_received_  ? "OK" : "WAITING",
-      gz_depth_received_ ? "OK" : "WAITING",
-      cloud_count_.load(),
-      unknown_format_count_.load());
 
-    if (!gz_info_received_) {
-      RCLCPP_WARN(get_logger(),
-        "No camera_info on '%s'", gz_camera_info_topic_.c_str());
-    }
-    if (!gz_depth_received_) {
-      RCLCPP_WARN(get_logger(),
-        "No depth image on '%s'", gz_depth_topic_.c_str());
-    }
-    if (unknown_format_count_ > 0) {
-      RCLCPP_WARN(get_logger(),
-        "Received %lu depth frames with unrecognised pixel format — "
-        "run `gz topic -i -t %s` and check the message type",
-        unknown_format_count_.load(), gz_depth_topic_.c_str());
-    }
-  }
 
   // ── gz callbacks (gz internal thread — NO RCLCPP_* macros) ──────────────
 
@@ -128,15 +105,9 @@ private:
     const int width  = static_cast<int>(msg.width());
     const int height = static_cast<int>(msg.height());
 
-    const bool is_float32 =
-      (msg.pixel_format_type() == gz::msgs::PixelFormatType::R_FLOAT32);
-    const bool is_uint16 =
-      (msg.pixel_format_type() == gz::msgs::PixelFormatType::L_INT16);
-
-    if (!is_float32 && !is_uint16) {
-      ++unknown_format_count_;
-      return;
-    }
+    const bool is_float32 = (msg.pixel_format_type() == gz::msgs::PixelFormatType::R_FLOAT32);
+    const bool is_uint16  = (msg.pixel_format_type() == gz::msgs::PixelFormatType::L_INT16);
+    if (!is_float32 && !is_uint16) { ++unknown_format_count_; return; }
 
     const auto * raw = reinterpret_cast<const uint8_t *>(msg.data().data());
 
@@ -144,31 +115,66 @@ private:
     cloud->header.stamp.sec     = static_cast<int32_t>(msg.header().stamp().sec());
     cloud->header.stamp.nanosec = static_cast<uint32_t>(msg.header().stamp().nsec());
     cloud->header.frame_id      = "camera_link";
-
     cloud->height       = static_cast<uint32_t>(height);
     cloud->width        = static_cast<uint32_t>(width);
     cloud->is_dense     = false;
     cloud->is_bigendian = false;
 
-    sensor_msgs::PointCloud2Modifier mod(*cloud);
-    mod.setPointCloud2FieldsByString(1, "xyz");
+    // ── Manual field descriptors — skips modifier overhead ───────────────────
+    cloud->fields.resize(3);
+    cloud->fields[0].name = "x"; cloud->fields[0].offset = 0;
+    cloud->fields[1].name = "y"; cloud->fields[1].offset = 4;
+    cloud->fields[2].name = "z"; cloud->fields[2].offset = 8;
+    for (auto & f : cloud->fields) {
+      f.datatype = sensor_msgs::msg::PointField::FLOAT32;
+      f.count    = 1;
+    }
+    cloud->point_step = 12;                          // 3 × float32
+    cloud->row_step   = cloud->point_step * width;
+    cloud->data.resize(cloud->row_step * height);
 
-    sensor_msgs::PointCloud2Iterator<float> ix(*cloud, "x");
-    sensor_msgs::PointCloud2Iterator<float> iy(*cloud, "y");
-    sensor_msgs::PointCloud2Iterator<float> iz(*cloud, "z");
+    // ── Single raw output pointer — no iterator overhead ─────────────────────
+    float * out = reinterpret_cast<float *>(cloud->data.data());
 
-    for (int row = 0; row < height; ++row) {
-      for (int col = 0; col < width; ++col, ++ix, ++iy, ++iz) {
-        float z = readDepth(raw, row, col, width, is_float32);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inv_fx = static_cast<float>(1.0 / fx);
+    const float inv_fy = static_cast<float>(1.0 / fy);
+    const float cx_f   = static_cast<float>(cx);
+    const float cy_f   = static_cast<float>(cy);
 
-        if (!std::isfinite(z) || z <= 0.0f) {
-          *ix = *iy = *iz = std::numeric_limits<float>::quiet_NaN();
-          continue;
+    if (is_float32) {
+      const float * depth = reinterpret_cast<const float *>(raw);
+      for (int row = 0; row < height; ++row) {
+        const float row_cy = static_cast<float>(row) - cy_f;
+        for (int col = 0; col < width; ++col) {
+          float z = depth[row * width + col];
+          float * p = out + (row * width + col) * 3;
+          if (!std::isfinite(z) || (z >= min_z && z <= max_z)) {
+            p[0] = p[1] = p[2] = nan;
+          } else {
+            p[0] = z;
+            p[1] = -(static_cast<float>(col) - cx_f) * z * inv_fx;
+            p[2] = -row_cy                            * z * inv_fy;
+          }
         }
-
-        *ix = static_cast<float>((col - cx) * z / fx);
-        *iy = static_cast<float>((row - cy) * z / fy);
-        *iz = z;
+      }
+    } else {
+      const uint16_t * depth = reinterpret_cast<const uint16_t *>(raw);
+      for (int row = 0; row < height; ++row) {
+        const float row_cy = static_cast<float>(row) - cy_f;
+        for (int col = 0; col < width; ++col) {
+          uint16_t raw_val = depth[row * width + col];
+          float * p = out + (row * width + col) * 3;
+          if (raw_val == 0) { p[0] = p[1] = p[2] = nan; continue; }
+          float z = static_cast<float>(raw_val) * 1e-3f;
+          if (z >= min_z && z <= max_z) {
+            p[0] = p[1] = p[2] = nan;
+          } else {
+            p[0] = z;
+            p[1] = -(static_cast<float>(col) - cx_f) * z * inv_fx;
+            p[2] = -row_cy                            * z * inv_fy;
+          }
+        }
       }
     }
 
@@ -193,7 +199,10 @@ private:
   std::string gz_depth_topic_;
   std::string gz_camera_info_topic_;
   std::string output_topic_;
-  double      null_range_;
+  double      null_range_min_;
+  double      null_range_max_;
+  float min_z;
+  float max_z;
 
   std::mutex info_mutex_;
   double fx_{0}, fy_{0}, cx_{0}, cy_{0};
@@ -205,7 +214,7 @@ private:
   std::atomic<uint64_t> unknown_format_count_{0};
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
-  rclcpp::TimerBase::SharedPtr                                diag_timer_;
+
 
   gz::transport::Node gz_node_;
 };
