@@ -16,6 +16,7 @@ find_package(gz-msgs10       REQUIRED)   # matches gz-transport version
 add_executable(depth_to_pointcloud_node
   src/depth_to_pointcloud_node.cpp
 )
+target_compile_options(depth_to_pointcloud_node PRIVATE -O3 -march=native)
 
 ament_target_dependencies(depth_to_pointcloud_node
   rclcpp

@@ -1,17 +1,53 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
 
 #include <gz/transport/Node.hh>
 #include <gz/msgs/image.pb.h>
 #include <gz/msgs/camera_info.pb.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+
+// ---------------------------------------------------------------------------
+// Raw depth frame — holds only what the gz callback copies off the wire
+// ---------------------------------------------------------------------------
+struct DepthFrame {
+  std::vector<uint8_t> data;
+  int      width{0}, height{0};
+  bool     is_float32{false};
+  int32_t  stamp_sec{0};
+  uint32_t stamp_nsec{0};
+};
+
+// ---------------------------------------------------------------------------
+// Pre-built PointCloud2 skeleton — fields/step set once, data resized lazily
+// ---------------------------------------------------------------------------
+static sensor_msgs::msg::PointCloud2::UniquePtr
+makeCloudShell(const std::string & frame_id)
+{
+  auto m = std::make_unique<sensor_msgs::msg::PointCloud2>();
+  m->header.frame_id = frame_id;
+  m->is_dense        = false;
+  m->is_bigendian    = false;
+  m->point_step      = 12;   // 3 × float32
+  m->fields.resize(3);
+  const char * names[] = {"x", "y", "z"};
+  for (int i = 0; i < 3; ++i) {
+    m->fields[i].name     = names[i];
+    m->fields[i].offset   = static_cast<uint32_t>(i * 4);
+    m->fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    m->fields[i].count    = 1;
+  }
+  return m;
+}
 
 class DepthToPointCloud : public rclcpp::Node
 {
@@ -21,215 +57,269 @@ public:
   {
     RCLCPP_INFO(get_logger(), "=== Constructor start ===");
 
-    try {
-      // ── Parameters ──────────────────────────────────────────────────────────
-      this->declare_parameter<std::string>("gz_depth",       "/depth_camera");
-      this->declare_parameter<std::string>("gz_camera_info", "/camera_info");
-      this->declare_parameter<double>     ("null_range_min",     0.0);
-      this->declare_parameter<double>     ("null_range_max",     1.0);
-      this->declare_parameter<std::string>("output_topic",   "/depth_camera_bridged/points");
+    // ── Parameters ────────────────────────────────────────────────────────────
+    declare_parameter<std::string>("gz_depth",       "/depth_camera");
+    declare_parameter<std::string>("gz_camera_info", "/camera_info");
+    declare_parameter<double>     ("null_range_min",  0.0);
+    declare_parameter<double>     ("null_range_max",  1.0);
+    declare_parameter<std::string>("output_topic",   "/depth_camera_bridged/points");
+    declare_parameter<bool>       ("best_effort",     true);
+    declare_parameter<int>        ("downsample",       1);   // 1=full res, 2=half, 4=quarter …
 
-      gz_depth_topic_       = this->get_parameter("gz_depth").as_string();
-      gz_camera_info_topic_ = this->get_parameter("gz_camera_info").as_string();
-      null_range_min_           = this->get_parameter("null_range_min").as_double();
-      null_range_max_           = this->get_parameter("null_range_max").as_double();
-      output_topic_         = this->get_parameter("output_topic").as_string();
-      min_z  = static_cast<float>(null_range_min_);
-      max_z  = static_cast<float>(null_range_max_);
+    gz_depth_topic_       = get_parameter("gz_depth").as_string();
+    gz_camera_info_topic_ = get_parameter("gz_camera_info").as_string();
+    min_z_ = static_cast<float>(get_parameter("null_range_min").as_double());
+    max_z_ = static_cast<float>(get_parameter("null_range_max").as_double());
+    output_topic_         = get_parameter("output_topic").as_string();
+    const bool best_effort = get_parameter("best_effort").as_bool();
+    downsample_ = static_cast<int>(std::max(int64_t{1}, get_parameter("downsample").as_int()));
 
-      RCLCPP_INFO(get_logger(), "gz_depth       : %s", gz_depth_topic_.c_str());
-      RCLCPP_INFO(get_logger(), "gz_camera_info : %s", gz_camera_info_topic_.c_str());
-      RCLCPP_INFO(get_logger(), "null_range_min     : %.4f", null_range_min_);
-      RCLCPP_INFO(get_logger(), "null_range_max     : %.4f", null_range_max_);
-      RCLCPP_INFO(get_logger(), "output_topic   : %s", output_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "gz_depth       : %s", gz_depth_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "gz_camera_info : %s", gz_camera_info_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "null_range     : [%.4f, %.4f]",
+      static_cast<double>(min_z_), static_cast<double>(max_z_));
+    RCLCPP_INFO(get_logger(), "output_topic   : %s", output_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "QoS            : %s",
+      best_effort ? "best_effort" : "reliable");
+    RCLCPP_INFO(get_logger(), "downsample     : %d (output res = 1/%d)",
+      downsample_, downsample_);
 
-      // ── Publisher ────────────────────────────────────────────────────────────
-      RCLCPP_INFO(get_logger(), "Creating publisher...");
-      pointcloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-        output_topic_, rclcpp::QoS(10).reliable());
-      RCLCPP_INFO(get_logger(), "Publisher created.");
+    // ── Publisher ─────────────────────────────────────────────────────────────
+    // best_effort avoids rmw blocking on subscriber flow-control.
+    auto qos = rclcpp::QoS(10);
+    qos.reliable();
+    pointcloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      output_topic_, qos);
 
+    // ── Double-buffer: ping-pong so convert and rmw serialise overlap ─────────
+    cloud_[0] = makeCloudShell("camera_link");
+    cloud_[1] = makeCloudShell("camera_link");
+    active_slot_ = 0;
 
+    // ── Publish thread ────────────────────────────────────────────────────────
+    publish_thread_ = std::thread(&DepthToPointCloud::publishLoop, this);
 
-      // ── gz-transport subscriptions ───────────────────────────────────────────
-      RCLCPP_INFO(get_logger(), "Subscribing to gz topics...");
+    // ── gz subscriptions ──────────────────────────────────────────────────────
+    bool ok_d = gz_node_.Subscribe(gz_depth_topic_,
+                  &DepthToPointCloud::onGzDepth, this);
+    bool ok_i = gz_node_.Subscribe(gz_camera_info_topic_,
+                  &DepthToPointCloud::onGzCameraInfo, this);
 
-      bool ok_depth = gz_node_.Subscribe(gz_depth_topic_,
-                        &DepthToPointCloud::onGzDepth, this);
-      RCLCPP_INFO(get_logger(), "gz Subscribe '%s' -> %s",
-        gz_depth_topic_.c_str(), ok_depth ? "OK" : "FAILED");
+    RCLCPP_INFO(get_logger(), "gz depth  '%s' -> %s",
+      gz_depth_topic_.c_str(), ok_d ? "OK" : "FAILED");
+    RCLCPP_INFO(get_logger(), "gz info   '%s' -> %s",
+      gz_camera_info_topic_.c_str(), ok_i ? "OK" : "FAILED");
+    RCLCPP_INFO(get_logger(), "=== Constructor complete ===");
+  }
 
-      bool ok_info = gz_node_.Subscribe(gz_camera_info_topic_,
-                       &DepthToPointCloud::onGzCameraInfo, this);
-      RCLCPP_INFO(get_logger(), "gz Subscribe '%s' -> %s",
-        gz_camera_info_topic_.c_str(), ok_info ? "OK" : "FAILED");
-
-      RCLCPP_INFO(get_logger(), "=== Constructor complete — node is running ===");
-
-    } catch (const std::exception & e) {
-      RCLCPP_FATAL(get_logger(), "Exception in constructor: %s", e.what());
-      throw;
-    } catch (...) {
-      RCLCPP_FATAL(get_logger(), "Unknown exception in constructor");
-      throw;
+  ~DepthToPointCloud()
+  {
+    {
+      std::lock_guard<std::mutex> lk(frame_mutex_);
+      shutdown_ = true;
     }
+    frame_cv_.notify_one();
+    if (publish_thread_.joinable()) publish_thread_.join();
   }
 
 private:
-
-
-  // ── gz callbacks (gz internal thread — NO RCLCPP_* macros) ──────────────
-
+  // ── Camera-info callback (gz thread) ──────────────────────────────────────
   void onGzCameraInfo(const gz::msgs::CameraInfo & msg)
   {
-    std::lock_guard<std::mutex> lock(info_mutex_);
-    fx_ = msg.intrinsics().k(0);
-    fy_ = msg.intrinsics().k(4);
-    cx_ = msg.intrinsics().k(2);
-    cy_ = msg.intrinsics().k(5);
-    has_info_         = true;
-    gz_info_received_ = true;
+    const auto & k = msg.intrinsics().k();
+    std::lock_guard<std::mutex> lk(info_mutex_);
+    fx_ = k[0];  cx_ = k[2];
+    fy_ = k[4];  cy_ = k[5];
+    has_info_ = true;
   }
 
+  // ── Depth callback (gz thread) — memcpy only, no math ────────────────────
   void onGzDepth(const gz::msgs::Image & msg)
   {
-    gz_depth_received_ = true;
-
-    double fx, fy, cx, cy;
     {
-      std::lock_guard<std::mutex> lock(info_mutex_);
-      if (!has_info_) { return; }
-      fx = fx_;  fy = fy_;  cx = cx_;  cy = cy_;
+      std::lock_guard<std::mutex> lk(info_mutex_);
+      if (!has_info_) return;
     }
 
-    const int width  = static_cast<int>(msg.width());
-    const int height = static_cast<int>(msg.height());
+    const bool is_f32 = (msg.pixel_format_type() ==
+                         gz::msgs::PixelFormatType::R_FLOAT32);
+    const bool is_u16 = (msg.pixel_format_type() ==
+                         gz::msgs::PixelFormatType::L_INT16);
+    if (!is_f32 && !is_u16) { ++unknown_format_count_; return; }
 
-    const bool is_float32 = (msg.pixel_format_type() == gz::msgs::PixelFormatType::R_FLOAT32);
-    const bool is_uint16  = (msg.pixel_format_type() == gz::msgs::PixelFormatType::L_INT16);
-    if (!is_float32 && !is_uint16) { ++unknown_format_count_; return; }
+    {
+      std::lock_guard<std::mutex> lk(frame_mutex_);
+      pending_.width      = static_cast<int>(msg.width());
+      pending_.height     = static_cast<int>(msg.height());
+      pending_.is_float32 = is_f32;
+      pending_.stamp_sec  = static_cast<int32_t> (msg.header().stamp().sec());
+      pending_.stamp_nsec = static_cast<uint32_t>(msg.header().stamp().nsec());
 
-    const auto * raw = reinterpret_cast<const uint8_t *>(msg.data().data());
-
-    auto cloud = std::make_unique<sensor_msgs::msg::PointCloud2>();
-    cloud->header.stamp.sec     = static_cast<int32_t>(msg.header().stamp().sec());
-    cloud->header.stamp.nanosec = static_cast<uint32_t>(msg.header().stamp().nsec());
-    cloud->header.frame_id      = "camera_link";
-    cloud->height       = static_cast<uint32_t>(height);
-    cloud->width        = static_cast<uint32_t>(width);
-    cloud->is_dense     = false;
-    cloud->is_bigendian = false;
-
-    // ── Manual field descriptors — skips modifier overhead ───────────────────
-    cloud->fields.resize(3);
-    cloud->fields[0].name = "x"; cloud->fields[0].offset = 0;
-    cloud->fields[1].name = "y"; cloud->fields[1].offset = 4;
-    cloud->fields[2].name = "z"; cloud->fields[2].offset = 8;
-    for (auto & f : cloud->fields) {
-      f.datatype = sensor_msgs::msg::PointField::FLOAT32;
-      f.count    = 1;
+      const std::size_t bytes = msg.data().size();
+      if (pending_.data.size() != bytes) pending_.data.resize(bytes);
+      std::memcpy(pending_.data.data(), msg.data().data(), bytes);
+      has_pending_ = true;
     }
-    cloud->point_step = 12;                          // 3 × float32
-    cloud->row_step   = cloud->point_step * width;
-    cloud->data.resize(cloud->row_step * height);
+    frame_cv_.notify_one();
+  }
 
-    // ── Single raw output pointer — no iterator overhead ─────────────────────
-    float * out = reinterpret_cast<float *>(cloud->data.data());
+  // ── Publish thread ────────────────────────────────────────────────────────
+  void publishLoop()
+  {
+    DepthFrame work;
 
-    const float nan = std::numeric_limits<float>::quiet_NaN();
-    const float inv_fx = static_cast<float>(1.0 / fx);
-    const float inv_fy = static_cast<float>(1.0 / fy);
-    const float cx_f   = static_cast<float>(cx);
-    const float cy_f   = static_cast<float>(cy);
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lk(frame_mutex_);
+        frame_cv_.wait(lk, [this]{ return has_pending_ || shutdown_; });
+        if (shutdown_) break;
+        std::swap(work, pending_);
+        has_pending_ = false;
+      }
 
-    if (is_float32) {
-      const float * depth = reinterpret_cast<const float *>(raw);
-      for (int row = 0; row < height; ++row) {
-        const float row_cy = static_cast<float>(row) - cy_f;
-        for (int col = 0; col < width; ++col) {
-          float z = depth[row * width + col];
-          float * p = out + (row * width + col) * 3;
+      float fx, fy, cx, cy;
+      {
+        std::lock_guard<std::mutex> lk(info_mutex_);
+        fx = static_cast<float>(fx_);
+        fy = static_cast<float>(fy_);
+        cx = static_cast<float>(cx_);
+        cy = static_cast<float>(cy_);
+      }
+
+      // Write into the slot that rmw finished with last iteration
+      const int slot = active_slot_ ^ 1;
+      convertInto(*cloud_[slot], work, fx, fy, cx, cy);
+      active_slot_ = slot;
+
+      pointcloud_pub_->publish(*cloud_[slot]);
+      ++cloud_count_;
+
+      if ((cloud_count_.load() % 150) == 0) {
+        RCLCPP_INFO(get_logger(),
+          "published %lu clouds | dropped (unknown fmt) %lu",
+          cloud_count_.load(), unknown_format_count_.load());
+      }
+    }
+  }
+
+  // ── Core pixel loop ───────────────────────────────────────────────────────
+  void convertInto(sensor_msgs::msg::PointCloud2 & cloud,
+                   const DepthFrame & f,
+                   float fx, float fy, float cx, float cy)
+  {
+    // Input dimensions
+    const int srcW = f.width;
+    const int srcH = f.height;
+    const int ds   = downsample_;           // stride in source pixels
+
+    // Output dimensions (floor division — drop partial edge)
+    const uint32_t W = static_cast<uint32_t>(srcW / ds);
+    const uint32_t H = static_cast<uint32_t>(srcH / ds);
+
+    if (cloud.width != W || cloud.height != H) {
+      cloud.width    = W;
+      cloud.height   = H;
+      cloud.row_step = cloud.point_step * W;
+      cloud.data.resize(cloud.row_step * H);
+    }
+    cloud.header.stamp.sec     = f.stamp_sec;
+    cloud.header.stamp.nanosec = f.stamp_nsec;
+
+    float * __restrict__ out =
+      reinterpret_cast<float *>(cloud.data.data());
+
+    const float nan    = std::numeric_limits<float>::quiet_NaN();
+    const float inv_fx = 1.0f / fx;
+    const float inv_fy = 1.0f / fy;
+    const float min_z  = min_z_;
+    const float max_z  = max_z_;
+    const int   iW     = static_cast<int>(W);
+    const int   iH     = static_cast<int>(H);
+
+    if (f.is_float32) {
+      const float * __restrict__ depth =
+        reinterpret_cast<const float *>(f.data.data());
+
+      for (int r = 0; r < iH; ++r) {
+        const int    src_r = r * ds;
+        const float  dy    = static_cast<float>(src_r) - cy;
+        const float *d_row = depth + src_r * srcW;
+        float       *o_row = out   + r * iW * 3;
+
+        for (int c = 0; c < iW; ++c) {
+          const int   src_c = c * ds;
+          const float z     = d_row[src_c];
+          float * p = o_row + c * 3;
           if (!std::isfinite(z) || (z >= min_z && z <= max_z)) {
             p[0] = p[1] = p[2] = nan;
           } else {
-            p[0] = z;
-            p[1] = -(static_cast<float>(col) - cx_f) * z * inv_fx;
-            p[2] = -row_cy                            * z * inv_fy;
+            p[0] =  z;
+            p[1] = -(static_cast<float>(src_c) - cx) * z * inv_fx;
+            p[2] = -dy * z * inv_fy;
           }
         }
       }
     } else {
-      const uint16_t * depth = reinterpret_cast<const uint16_t *>(raw);
-      for (int row = 0; row < height; ++row) {
-        const float row_cy = static_cast<float>(row) - cy_f;
-        for (int col = 0; col < width; ++col) {
-          uint16_t raw_val = depth[row * width + col];
-          float * p = out + (row * width + col) * 3;
-          if (raw_val == 0) { p[0] = p[1] = p[2] = nan; continue; }
-          float z = static_cast<float>(raw_val) * 1e-3f;
+      const uint16_t * __restrict__ depth =
+        reinterpret_cast<const uint16_t *>(f.data.data());
+
+      for (int r = 0; r < iH; ++r) {
+        const int       src_r = r * ds;
+        const float     dy    = static_cast<float>(src_r) - cy;
+        const uint16_t *d_row = depth + src_r * srcW;
+        float          *o_row = out   + r * iW * 3;
+
+        for (int c = 0; c < iW; ++c) {
+          const int      src_c = c * ds;
+          float * p = o_row + c * 3;
+          const uint16_t raw = d_row[src_c];
+          if (raw == 0) { p[0] = p[1] = p[2] = nan; continue; }
+          const float z = static_cast<float>(raw) * 1e-3f;
           if (z >= min_z && z <= max_z) {
             p[0] = p[1] = p[2] = nan;
           } else {
-            p[0] = z;
-            p[1] = -(static_cast<float>(col) - cx_f) * z * inv_fx;
-            p[2] = -row_cy                            * z * inv_fy;
+            p[0] =  z;
+            p[1] = -(static_cast<float>(src_c) - cx) * z * inv_fx;
+            p[2] = -dy * z * inv_fy;
           }
         }
       }
     }
-
-    pointcloud_pub_->publish(std::move(cloud));
-    ++cloud_count_;
   }
 
-  static float readDepth(const uint8_t * raw, int row, int col,
-                          int width, bool is_float32)
-  {
-    if (is_float32) {
-      float v;
-      std::memcpy(&v, raw + (row * width + col) * sizeof(float), sizeof(float));
-      return v;
-    }
-    uint16_t v;
-    std::memcpy(&v, raw + (row * width + col) * sizeof(uint16_t), sizeof(uint16_t));
-    return (v == 0) ? std::numeric_limits<float>::quiet_NaN()
-                    : static_cast<float>(v) * 1e-3f;
-  }
-
-  std::string gz_depth_topic_;
-  std::string gz_camera_info_topic_;
-  std::string output_topic_;
-  double      null_range_min_;
-  double      null_range_max_;
-  float min_z;
-  float max_z;
+  // ── Members ───────────────────────────────────────────────────────────────
+  std::string gz_depth_topic_, gz_camera_info_topic_, output_topic_;
+  float min_z_{0.0f}, max_z_{1.0f};
+  int   downsample_{2};
 
   std::mutex info_mutex_;
   double fx_{0}, fy_{0}, cx_{0}, cy_{0};
   bool   has_info_{false};
 
-  std::atomic<bool>     gz_info_received_{false};
-  std::atomic<bool>     gz_depth_received_{false};
+  std::mutex              frame_mutex_;
+  std::condition_variable frame_cv_;
+  DepthFrame              pending_;
+  bool                    has_pending_{false};
+  bool                    shutdown_{false};
+
+  // Double-buffer
+  std::unique_ptr<sensor_msgs::msg::PointCloud2> cloud_[2];
+  int active_slot_{0};
+
   std::atomic<uint64_t> cloud_count_{0};
   std::atomic<uint64_t> unknown_format_count_{0};
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
-
-
   gz::transport::Node gz_node_;
+  std::thread         publish_thread_;
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-
-  rclcpp::NodeOptions options;
   auto node = std::make_shared<DepthToPointCloud>();
-
   RCLCPP_INFO(node->get_logger(), "Entering spin...");
   rclcpp::spin(node);
-  RCLCPP_INFO(node->get_logger(), "Spin exited.");
-
   rclcpp::shutdown();
   return 0;
 }
