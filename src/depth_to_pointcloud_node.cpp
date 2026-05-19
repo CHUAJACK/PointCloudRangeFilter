@@ -204,15 +204,13 @@ private:
 
   // ── Core pixel loop ───────────────────────────────────────────────────────
   void convertInto(sensor_msgs::msg::PointCloud2 & cloud,
-                   const DepthFrame & f,
-                   float fx, float fy, float cx, float cy)
+                 const DepthFrame & f,
+                 float fx, float fy, float cx, float cy)
   {
-    // Input dimensions
     const int srcW = f.width;
     const int srcH = f.height;
-    const int ds   = downsample_;           // stride in source pixels
+    const int ds   = downsample_;
 
-    // Output dimensions (floor division — drop partial edge)
     const uint32_t W = static_cast<uint32_t>(srcW / ds);
     const uint32_t H = static_cast<uint32_t>(srcH / ds);
 
@@ -236,6 +234,16 @@ private:
     const int   iW     = static_cast<int>(W);
     const int   iH     = static_cast<int>(H);
 
+    // ── FOV crop window (in source pixel coordinates) ────────────────────────
+    // Crop depth frame so its effective FOV matches the RGB camera (IMX214).
+    // Depth HFOV=1.274 rad, RGB HFOV=1.204 rad, same physical pose.
+    // Valid columns: [2.75%, 97.25%] of srcW  → trim 2.75% each side
+    // Valid rows:    [14.31%, 85.69%] of srcH  → trim 14.31% each side
+    const int crop_col_min = static_cast<int>(std::floor(0.0275f * static_cast<float>(srcW)));
+    const int crop_col_max = static_cast<int>(std::floor(0.9725f * static_cast<float>(srcW)));
+    const int crop_row_min = static_cast<int>(std::floor(0.1431f * static_cast<float>(srcH)));
+    const int crop_row_max = static_cast<int>(std::floor(0.8569f * static_cast<float>(srcH)));
+
     if (f.is_float32) {
       const float * __restrict__ depth =
         reinterpret_cast<const float *>(f.data.data());
@@ -248,8 +256,16 @@ private:
 
         for (int c = 0; c < iW; ++c) {
           const int   src_c = c * ds;
-          const float z     = d_row[src_c];
           float * p = o_row + c * 3;
+
+          // Outside FOV crop window → NaN
+          if (src_r < crop_row_min || src_r >= crop_row_max ||
+              src_c < crop_col_min || src_c >= crop_col_max) {
+            p[0] = p[1] = p[2] = nan;
+            continue;
+          }
+
+          const float z = d_row[src_c];
           if (!std::isfinite(z) || (z >= min_z && z <= max_z)) {
             p[0] = p[1] = p[2] = nan;
           } else {
@@ -272,6 +288,14 @@ private:
         for (int c = 0; c < iW; ++c) {
           const int      src_c = c * ds;
           float * p = o_row + c * 3;
+
+          // Outside FOV crop window → NaN
+          if (src_r < crop_row_min || src_r >= crop_row_max ||
+              src_c < crop_col_min || src_c >= crop_col_max) {
+            p[0] = p[1] = p[2] = nan;
+            continue;
+          }
+
           const uint16_t raw = d_row[src_c];
           if (raw == 0) { p[0] = p[1] = p[2] = nan; continue; }
           const float z = static_cast<float>(raw) * 1e-3f;
