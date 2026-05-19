@@ -116,6 +116,8 @@ private:
   float       min_z_{0.0f};           ///< null-range lower bound [m]
   float       max_z_{1.0f};           ///< null-range upper bound [m]
   int         downsample_{1};         ///< pixel stride (1 = full resolution)
+  int         strip_width_{10};
+  float       danger_threshold_{0.5};
 
   // ── Camera intrinsics (written by onGzCameraInfo) ─────────────────────────
   std::mutex info_mutex_;

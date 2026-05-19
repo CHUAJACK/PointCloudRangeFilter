@@ -1,5 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <gz/transport/Node.hh>
 #include <gz/msgs/image.pb.h>
@@ -58,38 +59,45 @@ public:
     RCLCPP_INFO(get_logger(), "=== Constructor start ===");
 
     // ── Parameters ────────────────────────────────────────────────────────────
-    declare_parameter<std::string>("gz_depth",       "/depth_camera");
-    declare_parameter<std::string>("gz_camera_info", "/camera_info");
-    declare_parameter<double>     ("null_range_min",  0.0);
-    declare_parameter<double>     ("null_range_max",  1.0);
-    declare_parameter<std::string>("output_topic",   "/depth_camera_bridged/points");
-    declare_parameter<bool>       ("best_effort",     true);
-    declare_parameter<int>        ("downsample",       1);   // 1=full res, 2=half, 4=quarter …
+    declare_parameter<std::string>("gz_depth",          "/depth_camera");
+    declare_parameter<std::string>("gz_camera_info",    "/camera_info");
+    declare_parameter<double>     ("null_range_min",     0.0);
+    declare_parameter<double>     ("null_range_max",     1.0);
+    declare_parameter<std::string>("output_topic",      "/depth_camera_bridged/points");
+    declare_parameter<bool>       ("best_effort",        true);
+    declare_parameter<int>        ("downsample",         1);
+    declare_parameter<int>        ("strip_width",        20);
+    declare_parameter<double>     ("danger_threshold",   1.0);
 
     gz_depth_topic_       = get_parameter("gz_depth").as_string();
     gz_camera_info_topic_ = get_parameter("gz_camera_info").as_string();
-    min_z_ = static_cast<float>(get_parameter("null_range_min").as_double());
-    max_z_ = static_cast<float>(get_parameter("null_range_max").as_double());
+    min_z_             = static_cast<float>(get_parameter("null_range_min").as_double());
+    max_z_             = static_cast<float>(get_parameter("null_range_max").as_double());
     output_topic_         = get_parameter("output_topic").as_string();
     const bool best_effort = get_parameter("best_effort").as_bool();
-    downsample_ = static_cast<int>(std::max(int64_t{1}, get_parameter("downsample").as_int()));
+    downsample_        = static_cast<int>(std::max(int64_t{1}, get_parameter("downsample").as_int()));
+    strip_width_       = static_cast<int>(get_parameter("strip_width").as_int());
+    danger_threshold_  = static_cast<float>(get_parameter("danger_threshold").as_double());
 
-    RCLCPP_INFO(get_logger(), "gz_depth       : %s", gz_depth_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "gz_camera_info : %s", gz_camera_info_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "null_range     : [%.4f, %.4f]",
+    RCLCPP_INFO(get_logger(), "gz_depth          : %s", gz_depth_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "gz_camera_info    : %s", gz_camera_info_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "null_range        : [%.4f, %.4f]",
       static_cast<double>(min_z_), static_cast<double>(max_z_));
-    RCLCPP_INFO(get_logger(), "output_topic   : %s", output_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "QoS            : %s",
+    RCLCPP_INFO(get_logger(), "output_topic      : %s", output_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "QoS               : %s",
       best_effort ? "best_effort" : "reliable");
-    RCLCPP_INFO(get_logger(), "downsample     : %d (output res = 1/%d)",
+    RCLCPP_INFO(get_logger(), "downsample        : %d (output res = 1/%d)",
       downsample_, downsample_);
+    RCLCPP_INFO(get_logger(), "strip_width       : %d px", strip_width_);
+    RCLCPP_INFO(get_logger(), "danger_threshold  : %.3f m",
+      static_cast<double>(danger_threshold_));
 
-    // ── Publisher ─────────────────────────────────────────────────────────────
-    // best_effort avoids rmw blocking on subscriber flow-control.
+    // ── Publishers ────────────────────────────────────────────────────────────
     auto qos = rclcpp::QoS(10);
     qos.reliable();
     pointcloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       output_topic_, qos);
+    threshold_pub_ = create_publisher<std_msgs::msg::Bool>("Threshold", qos);
 
     // ── Double-buffer: ping-pong so convert and rmw serialise overlap ─────────
     cloud_[0] = makeCloudShell("camera_link");
@@ -186,13 +194,41 @@ private:
         cy = static_cast<float>(cy_);
       }
 
-      // Write into the slot that rmw finished with last iteration
       const int slot = active_slot_ ^ 1;
       convertInto(*cloud_[slot], work, fx, fy, cx, cy);
       active_slot_ = slot;
 
       pointcloud_pub_->publish(*cloud_[slot]);
       ++cloud_count_;
+
+      // ── Horizontal strip obstacle check ───────────────────────────────────
+      {
+        const auto & c       = *cloud_[slot];
+        const int    iW      = static_cast<int>(c.width);
+        const int    iH      = static_cast<int>(c.height);
+        const int    half_sw = strip_width_ / 2;
+        const int    row_mid = iH / 2;
+        const int    row_min = std::max(0,  row_mid - half_sw);
+        const int    row_max = std::min(iH, row_mid + half_sw);
+        const float  thresh  = danger_threshold_;
+
+        bool clear = false;
+        const float * data = reinterpret_cast<const float *>(c.data.data());
+
+        for (int r = row_min; r < row_max && clear; ++r) {
+          const float * row = data + r * iW * 3;
+          for (int col = 0; col < iW && clear; ++col) {
+            const float z = row[col * 3];   // p[0] stores forward distance
+            if (std::isfinite(z) && z < thresh) {
+              clear = true;
+            }
+          }
+        }
+
+        std_msgs::msg::Bool threshold_msg;
+        threshold_msg.data = clear;
+        threshold_pub_->publish(threshold_msg);
+      }
 
       if ((cloud_count_.load() % 150) == 0) {
         RCLCPP_INFO(get_logger(),
@@ -204,8 +240,8 @@ private:
 
   // ── Core pixel loop ───────────────────────────────────────────────────────
   void convertInto(sensor_msgs::msg::PointCloud2 & cloud,
-                 const DepthFrame & f,
-                 float fx, float fy, float cx, float cy)
+                   const DepthFrame & f,
+                   float fx, float fy, float cx, float cy)
   {
     const int srcW = f.width;
     const int srcH = f.height;
@@ -234,7 +270,7 @@ private:
     const int   iW     = static_cast<int>(W);
     const int   iH     = static_cast<int>(H);
 
-    // ── FOV crop window (in source pixel coordinates) ────────────────────────
+    // ── FOV crop window (in source pixel coordinates) ─────────────────────
     // Crop depth frame so its effective FOV matches the RGB camera (IMX214).
     // Depth HFOV=1.274 rad, RGB HFOV=1.204 rad, same physical pose.
     // Valid columns: [2.75%, 97.25%] of srcW  → trim 2.75% each side
@@ -249,18 +285,17 @@ private:
         reinterpret_cast<const float *>(f.data.data());
 
       for (int r = 0; r < iH; ++r) {
-        const int    src_r = r * ds;
-        const float  dy    = static_cast<float>(src_r) - cy;
-        const float *d_row = depth + src_r * srcW;
-        float       *o_row = out   + r * iW * 3;
+        const int    src_r     = r * ds;
+        const float  dy        = static_cast<float>(src_r) - cy;
+        const float *d_row     = depth + src_r * srcW;
+        float       *o_row     = out   + r * iW * 3;
+        const bool   row_valid = (src_r >= crop_row_min && src_r < crop_row_max);
 
         for (int c = 0; c < iW; ++c) {
           const int   src_c = c * ds;
           float * p = o_row + c * 3;
 
-          // Outside FOV crop window → NaN
-          if (src_r < crop_row_min || src_r >= crop_row_max ||
-              src_c < crop_col_min || src_c >= crop_col_max) {
+          if (!row_valid || src_c < crop_col_min || src_c >= crop_col_max) {
             p[0] = p[1] = p[2] = nan;
             continue;
           }
@@ -280,18 +315,17 @@ private:
         reinterpret_cast<const uint16_t *>(f.data.data());
 
       for (int r = 0; r < iH; ++r) {
-        const int       src_r = r * ds;
-        const float     dy    = static_cast<float>(src_r) - cy;
-        const uint16_t *d_row = depth + src_r * srcW;
-        float          *o_row = out   + r * iW * 3;
+        const int       src_r     = r * ds;
+        const float     dy        = static_cast<float>(src_r) - cy;
+        const uint16_t *d_row     = depth + src_r * srcW;
+        float          *o_row     = out   + r * iW * 3;
+        const bool      row_valid = (src_r >= crop_row_min && src_r < crop_row_max);
 
         for (int c = 0; c < iW; ++c) {
           const int      src_c = c * ds;
           float * p = o_row + c * 3;
 
-          // Outside FOV crop window → NaN
-          if (src_r < crop_row_min || src_r >= crop_row_max ||
-              src_c < crop_col_min || src_c >= crop_col_max) {
+          if (!row_valid || src_c < crop_col_min || src_c >= crop_col_max) {
             p[0] = p[1] = p[2] = nan;
             continue;
           }
@@ -314,7 +348,9 @@ private:
   // ── Members ───────────────────────────────────────────────────────────────
   std::string gz_depth_topic_, gz_camera_info_topic_, output_topic_;
   float min_z_{0.0f}, max_z_{1.0f};
-  int   downsample_{2};
+  int   downsample_{1};
+  int   strip_width_{20};
+  float danger_threshold_{1.0f};
 
   std::mutex info_mutex_;
   double fx_{0}, fy_{0}, cx_{0}, cy_{0};
@@ -334,6 +370,7 @@ private:
   std::atomic<uint64_t> unknown_format_count_{0};
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr           threshold_pub_;
   gz::transport::Node gz_node_;
   std::thread         publish_thread_;
 };
