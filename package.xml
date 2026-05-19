@@ -2,8 +2,11 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>depth_to_pointcloud</name>
-  <version>0.1.0</version>
-  <description>Converts a Gazebo depth image to a PointCloud2 message.</description>
+  <version>0.2.0</version>
+  <description>
+    Subscribes to a Gazebo (gz-transport) depth image and camera_info,
+    back-projects pixels into 3D, and publishes a ROS2 PointCloud2.
+  </description>
 
   <maintainer email="you@example.com">Your Name</maintainer>
   <license>Apache-2.0</license>
@@ -12,9 +15,10 @@
 
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
-  <depend>cv_bridge</depend>
-  <depend>message_filters</depend>
-  <depend>libopencv-dev</depend>
+
+  <!-- gz-transport / gz-msgs are system deps, not ament packages -->
+  <build_depend>gz-transport13</build_depend>
+  <build_depend>gz-msgs10</build_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
