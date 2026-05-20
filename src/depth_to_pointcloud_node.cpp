@@ -215,9 +215,9 @@ private:
         bool clear = false;
         const float * data = reinterpret_cast<const float *>(c.data.data());
 
-        for (int r = row_min; r < row_max && clear; ++r) {
+        for (int r = row_min; r < row_max && !clear; ++r) {
           const float * row = data + r * iW * 3;
-          for (int col = 0; col < iW && clear; ++col) {
+          for (int col = 0; col < iW && !clear; ++col) {
             const float z = row[col * 3];   // p[0] stores forward distance
             if (std::isfinite(z) && z < thresh) {
               clear = true;
